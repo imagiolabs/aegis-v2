@@ -12,14 +12,23 @@
 //!   channel. Telemetry stays here, so a slow disk never holds up a
 //!   record.
 //!
+//! Only executables an allowlist entry or a pin names are verified: for
+//! any other a verdict changes nothing, so it stays Unverified at no
+//! cost.
+//!
 //! Scoring a process waits for its verification. A fresh exec is
 //! Unverified for the moment it takes the verdict to return, and an
 //! allowlisted binary (runc's memfd self-clone, systemd's unit memfds,
 //! gdb attaching) would score in that gap. So a signal whose verdict is
 //! still in flight is deferred and scored when the verdict lands, or
-//! after a 2 s deadline as Unverified.
+//! after `DEFER_DEADLINE` as Unverified.
+//!
+//! Inside an open incident, a decision is recorded and sent to
+//! telemetry only when it says something new: the tier rose, a process
+//! showed a signal kind it hadn't before, or a minute has passed since
+//! the incident last spoke. The rest are counted in `incident_suppressed`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -30,12 +39,12 @@ use aegis_common::{Event, EventKind, EXEC_MEMFD, PATH_TRUNCATED};
 
 use crate::config::{Config, Mode};
 use crate::incident::{new_incident_id, verdict, IncidentStore};
-use crate::proctable::{ProcInfo, ProcKey, ProcTable};
+use crate::proctable::{env_taint, ProcInfo, ProcKey, ProcTable, UNREADABLE};
 use crate::scoring::{
-    signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal, KINDS,
+    signals_for, DaemonClassifier, Decision, ScanDetector, Scorer, Signal, SignalKind, Tier, KINDS,
 };
 use crate::telemetry::{now_ns, Sinks, TelemetryRecord};
-use crate::verify::Verification;
+use crate::verify::{Verification, RPM_TIMEOUT};
 
 /// What a verdict is about: the exe path, which names the file for rpm
 /// and the pins, and the (dev, ino) the process actually ran. Two
@@ -49,9 +58,22 @@ pub type ExeKey = (PathBuf, (u64, u64));
 pub type RecordJob = (Decision, Vec<ProcInfo>, Mode, String);
 
 /// How long a signal waits for its verdict before it scores Unverified.
-const DEFER_DEADLINE: Duration = Duration::from_secs(2);
+/// A verification is at worst two rpm calls at their timeout plus a
+/// hash, so this leaves room for the hash on top.
+const DEFER_DEADLINE: Duration = Duration::from_secs(6);
+const _: () = assert!(DEFER_DEADLINE.as_secs() > 2 * RPM_TIMEOUT.as_secs());
 /// Per process, pending deferred signals; past this they score at once.
 const MAX_DEFERRED_PER_PROC: usize = 64;
+/// Deferred signals across every process; past this they score at once.
+const MAX_DEFERRED: usize = 8192;
+/// How long an environment read may take before it counts as unreadable.
+/// A process can make the read block for good, so it never runs here.
+const ENV_DEADLINE: Duration = Duration::from_secs(1);
+/// Environment reads in flight; past this a process is tainted at once.
+const MAX_ENV_READS: usize = 256;
+/// Inside an incident, the longest it stays quiet while decisions keep
+/// coming that add nothing new.
+const HEARTBEAT_NS: u64 = 60 * 1_000_000_000;
 /// Executables being verified at once; past this an exec stays Unverified.
 const MAX_PENDING: usize = 1024;
 /// Processes waiting on one path's verdict (forks pile up here).
@@ -77,9 +99,10 @@ impl Incidents {
     }
 }
 
-/// A signal held back until the gate process's verification lands.
+/// A signal held back until what its trust depends on is known: the
+/// gate process's verdict, and the environment of the processes whose
+/// allowlist entries it could earn.
 struct Deferred {
-    gate: ExeKey,
     /// True when the verdict belongs to the parent (a TmpExec is judged
     /// by its parent), false when it belongs to the subject itself.
     gate_is_parent: bool,
@@ -89,6 +112,33 @@ struct Deferred {
     target: Option<PathBuf>,
     ts_ns: u64,
     deadline: Instant,
+    waits_exe: Option<ExeKey>,
+    waits_env: Vec<ProcKey>,
+}
+
+/// An environment read for the caller to run off the loop: the process,
+/// the image (dev, ino) the answer must be about, and the request's
+/// sequence number. A re-exec of the same file keeps the key and the
+/// image, so only the number tells a superseded answer from the current.
+pub type EnvJob = (ProcKey, (u64, u64), u64);
+
+#[cfg(test)]
+type EnvBytes = Vec<u8>;
+
+/// Reads an environment: tgid, start time, the image it must still be.
+pub type EnvReader = fn(u32, u64, (u64, u64)) -> Option<Vec<u8>>;
+
+/// What an open incident has already said, so a repeat isn't said again.
+#[derive(Default)]
+struct Spoken {
+    tier: Option<Tier>,
+    /// Per member, the signal kinds already recorded, one bit per kind.
+    seen: HashMap<ProcKey, u8>,
+    last_ns: Option<u64>,
+}
+
+fn bit(k: SignalKind) -> u8 {
+    1 << k as u8
 }
 
 pub struct Pipeline {
@@ -102,7 +152,30 @@ pub struct Pipeline {
     /// Verifications in flight, by what is being verified: who is
     /// waiting, and the exe each had when it asked.
     pending: HashMap<ExeKey, Vec<(ProcKey, PathBuf)>>,
-    deferred: Vec<Deferred>,
+    /// Signals waiting, by id, and the ids waiting on each verdict and
+    /// on each process's environment. An index may hold ids already gone.
+    deferred: HashMap<u64, Deferred>,
+    next_id: u64,
+    by_exe: HashMap<ExeKey, Vec<u64>>,
+    by_env: HashMap<ProcKey, Vec<u64>>,
+    /// Signals in `deferred`, per subject process.
+    held: HashMap<ProcKey, usize>,
+    /// Environment reads in flight: the image each is about, and when it
+    /// stops waiting and counts as unreadable.
+    env_reads: HashMap<ProcKey, (EnvJob, Instant)>,
+    env_seq: u64,
+    /// Environment reads for the caller to run.
+    pub to_read_env: Vec<EnvJob>,
+    /// Tests: answer every environment read at once, as an instant
+    /// worker would.
+    #[cfg(test)]
+    env_auto: Option<fn(ProcKey) -> Option<EnvBytes>>,
+    /// The executables worth verifying: `Allowlist::verify_paths`.
+    verify_paths: BTreeSet<PathBuf>,
+    /// Per incident id, what it has recorded so far.
+    // ponytail: one entry per incident for the daemon's life, like the
+    // store's own map; evict both together if that ever matters.
+    spoken: HashMap<String, Spoken>,
     /// Incident membership on the loop, by a local group number: the
     /// same grouping rule the store applies, kept here so the incident
     /// score can be computed without waiting on the writer thread.
@@ -118,6 +191,8 @@ pub struct Pipeline {
     pub incident_dropped: u64,
     pub verify_skipped: u64,
     pub deferred_overflow: u64,
+    /// Incident decisions not recorded, as they added nothing new.
+    pub incident_suppressed: u64,
     debug: bool,
 }
 
@@ -139,7 +214,18 @@ impl Pipeline {
             sinks,
             mode: cfg.general.mode,
             pending: HashMap::new(),
-            deferred: Vec::new(),
+            deferred: HashMap::new(),
+            next_id: 0,
+            by_exe: HashMap::new(),
+            by_env: HashMap::new(),
+            held: HashMap::new(),
+            env_reads: HashMap::new(),
+            env_seq: 0,
+            to_read_env: Vec::new(),
+            #[cfg(test)]
+            env_auto: None,
+            verify_paths: cfg.allowlist.verify_paths(),
+            spoken: HashMap::new(),
             // Seeded once from what the store loaded, so an incident opened
             // before a restart keeps its members. After this the store is
             // never asked: its lock must stay off the event loop's path.
@@ -151,6 +237,7 @@ impl Pipeline {
             incident_dropped: 0,
             verify_skipped: 0,
             deferred_overflow: 0,
+            incident_suppressed: 0,
             debug,
         }
     }
@@ -168,6 +255,7 @@ impl Pipeline {
         self.scorer.set_config(cfg);
         self.scan.set_config(cfg.scoring.scan.clone());
         self.mode = cfg.general.mode;
+        self.verify_paths = cfg.allowlist.verify_paths();
     }
 
     /// Pins may have changed on reload, so a `Pinned` verdict no longer
@@ -189,6 +277,7 @@ impl Pipeline {
         if kind != Some(EventKind::Exit) && self.table.ensure(ev) && kind != Some(EventKind::Exec) {
             // Found late, with its exe read from /proc: verify that.
             self.request_verification(key);
+            self.request_env(key);
         }
         let mut sigs = signals_for(ev, &self.table, &*self.daemons);
         if kind == Some(EventKind::Connect) {
@@ -222,10 +311,125 @@ impl Pipeline {
             _ => {}
         }
         self.table.apply(ev);
-        // A memfd has no path to open, and a truncated path is not the file.
-        if kind == Some(EventKind::Exec) && ev.flags & (EXEC_MEMFD | PATH_TRUNCATED) == 0 {
-            self.request_verification(key);
+        match kind {
+            Some(EventKind::Exec) => {
+                // A memfd has no path to open, and a truncated path is not
+                // the file.
+                if ev.flags & (EXEC_MEMFD | PATH_TRUNCATED) == 0 {
+                    self.request_verification(key);
+                }
+                self.request_env(key);
+            }
+            // The child has its parent's environment, but if that is still
+            // being read, the child needs its own answer.
+            Some(EventKind::Fork) if self.env_reads.contains_key(&key) => {
+                self.request_env(ProcKey {
+                    tgid: ev.child_tgid,
+                    start_time_ns: ev.child_start_time_ns,
+                });
+            }
+            _ => {}
         }
+    }
+
+    /// Queues a read of this process's environment, if anything it could
+    /// be trusted for depends on it: an allowlisted or pinned exe, or an
+    /// excluded SELinux domain. Until the answer lands it is tainted.
+    fn request_env(&mut self, key: ProcKey) {
+        let Some(p) = self.table.get(&key) else {
+            return;
+        };
+        let wants = p
+            .exe
+            .as_ref()
+            .is_some_and(|e| self.verify_paths.contains(e))
+            || self.scorer.selinux_excluded(p);
+        if !wants {
+            return;
+        }
+        let Some(image) = p.exe_id else {
+            self.table.set_env(&key, Some(UNREADABLE), false);
+            return;
+        };
+        // An older read for this process was about an image it no longer
+        // runs; whatever waited on it can't be told now.
+        if self.env_reads.contains_key(&key) {
+            self.env_resolve(&key, Some(UNREADABLE));
+        }
+        if self.env_reads.len() >= MAX_ENV_READS {
+            self.table.set_env(&key, Some(UNREADABLE), false);
+            return;
+        }
+        self.table.set_env(&key, None, true);
+        let job = (key, image, self.env_seq);
+        self.env_seq += 1;
+        self.env_reads
+            .insert(key, (job, Instant::now() + ENV_DEADLINE));
+        self.to_read_env.push(job);
+        #[cfg(test)]
+        if let Some(f) = self.env_auto {
+            self.to_read_env.pop();
+            self.env_read(job, f(key));
+        }
+    }
+
+    /// The answer to a job queued in `to_read_env`: the environment, or
+    /// None if it couldn't be read. Ignored if that read was superseded
+    /// or timed out.
+    pub fn env_read(&mut self, job: EnvJob, env: Option<Vec<u8>>) {
+        let (key, image, _) = job;
+        if self.env_reads.get(&key).map(|r| r.0) != Some(job) {
+            return;
+        }
+        let taint = env_taint(env.as_deref());
+        if self
+            .table
+            .get(&key)
+            .is_some_and(|p| p.exe_id == Some(image))
+        {
+            self.table.set_env(&key, taint, false);
+        }
+        self.env_resolve(&key, taint);
+    }
+
+    /// `key`'s environment is settled as `taint`: put it on every
+    /// signal waiting for it, and score those with nothing left to wait on.
+    fn env_resolve(&mut self, key: &ProcKey, taint: Option<&'static str>) {
+        self.env_reads.remove(key);
+        for id in self.by_env.remove(key).unwrap_or_default() {
+            let Some(d) = self.deferred.get_mut(&id) else {
+                continue;
+            };
+            for p in std::iter::once(&mut d.subject).chain(d.ancestors.first_mut()) {
+                if p.key == *key {
+                    p.env_taint = taint;
+                    p.env_pending = false;
+                }
+            }
+            d.waits_env.retain(|k| k != key);
+            self.try_release(id);
+        }
+        self.reap_exited();
+    }
+
+    /// Scores deferred signal `id` if it no longer waits on anything.
+    fn try_release(&mut self, id: u64) {
+        let ready = self
+            .deferred
+            .get(&id)
+            .is_some_and(|d| d.waits_exe.is_none() && d.waits_env.is_empty());
+        if !ready {
+            return;
+        }
+        let d = self.deferred.remove(&id).unwrap();
+        self.release(&d.subject.key);
+        self.score(
+            &d.subject,
+            &d.ancestors,
+            d.signal,
+            d.target.as_deref(),
+            d.ts_ns,
+        );
     }
 
     /// Scores a signal now, or defers it if the verdict it needs is still
@@ -243,20 +447,34 @@ impl Pipeline {
         } else {
             Some(&subject)
         };
-        let gate = gated.and_then(|p| Some((p.exe.clone()?, p.exe_id?)));
+        let waits_exe = gated
+            .and_then(|p| Some((p.exe.clone()?, p.exe_id?)))
+            .filter(|g| self.pending.contains_key(g));
+        // Whose environment the modifiers depend on: the subject's (its own
+        // lists, its SELinux domain) and, for a tmp exec, the parent's.
+        let waits_env: Vec<ProcKey> = std::iter::once(&subject)
+            .chain(ancestors.first().filter(|_| gate_is_parent))
+            .filter(|p| p.env_pending)
+            .map(|p| p.key)
+            .collect();
 
-        if let Some(path) = gate {
-            if self.pending.contains_key(&path) {
-                let held = self
-                    .deferred
-                    .iter()
-                    .filter(|d| d.subject.key == key)
-                    .count();
-                if held >= MAX_DEFERRED_PER_PROC {
-                    self.deferred_overflow += 1;
-                } else {
-                    self.deferred.push(Deferred {
-                        gate: path,
+        if waits_exe.is_some() || !waits_env.is_empty() {
+            let held = self.held.get(&key).copied().unwrap_or(0);
+            if held >= MAX_DEFERRED_PER_PROC || self.deferred.len() >= MAX_DEFERRED {
+                self.deferred_overflow += 1;
+            } else {
+                let id = self.next_id;
+                self.next_id += 1;
+                *self.held.entry(key).or_default() += 1;
+                if let Some(g) = &waits_exe {
+                    self.by_exe.entry(g.clone()).or_default().push(id);
+                }
+                for k in &waits_env {
+                    self.by_env.entry(*k).or_default().push(id);
+                }
+                self.deferred.insert(
+                    id,
+                    Deferred {
                         gate_is_parent,
                         subject,
                         ancestors,
@@ -264,9 +482,11 @@ impl Pipeline {
                         target,
                         ts_ns,
                         deadline: Instant::now() + DEFER_DEADLINE,
-                    });
-                    return;
-                }
+                        waits_exe,
+                        waits_env,
+                    },
+                );
+                return;
             }
         }
         self.score(&subject, &ancestors, sig, target.as_deref(), ts_ns);
@@ -280,7 +500,9 @@ impl Pipeline {
         else {
             return;
         };
-        if exe.as_os_str().is_empty() {
+        // Not named by any allowlist or pin: no verdict would change its
+        // score, so no rpm call and no hash.
+        if exe.as_os_str().is_empty() || !self.verify_paths.contains(&exe) {
             return;
         }
         let path = (exe.clone(), id);
@@ -314,20 +536,10 @@ impl Pipeline {
                 self.table.set_verification(&k, v.clone());
             }
         }
-        let ready: Vec<Deferred> = {
-            let mut keep = Vec::new();
-            let mut ready = Vec::new();
-            for d in self.deferred.drain(..) {
-                if d.gate == *path {
-                    ready.push(d);
-                } else {
-                    keep.push(d);
-                }
-            }
-            self.deferred = keep;
-            ready
-        };
-        for mut d in ready {
+        for id in self.by_exe.remove(path).unwrap_or_default() {
+            let Some(d) = self.deferred.get_mut(&id) else {
+                continue;
+            };
             // The gate's verdict is known now; put it on the snapshot.
             let gated = if d.gate_is_parent {
                 d.ancestors.first_mut()
@@ -337,6 +549,37 @@ impl Pipeline {
             if let Some(p) = gated {
                 p.verification = v.clone();
             }
+            d.waits_exe = None;
+            self.try_release(id);
+        }
+        self.reap_exited();
+    }
+
+    /// Scores every signal whose deadline has passed, as Unverified or
+    /// tainted for whatever it still waited on, and gives up on
+    /// environment reads past theirs. The caller runs this on a timer.
+    pub fn flush_expired(&mut self, cutoff: Instant) {
+        let late: Vec<ProcKey> = self
+            .env_reads
+            .iter()
+            .filter(|(_, (_, at))| *at <= cutoff)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in late {
+            let job = self.env_reads[&k].0;
+            self.env_read(job, None);
+        }
+        let mut expired: Vec<(u64, u64)> = self
+            .deferred
+            .iter()
+            .filter(|(_, d)| d.deadline <= cutoff)
+            .map(|(id, d)| (d.ts_ns, *id))
+            .collect();
+        // In the order they happened, whatever each waited on.
+        expired.sort();
+        for (_, id) in expired {
+            let d = self.deferred.remove(&id).unwrap();
+            self.release(&d.subject.key);
             self.score(
                 &d.subject,
                 &d.ancestors,
@@ -348,22 +591,14 @@ impl Pipeline {
         self.reap_exited();
     }
 
-    /// Scores every signal whose deadline has passed as Unverified. The
-    /// caller runs this on a timer.
-    pub fn flush_expired(&mut self, cutoff: Instant) {
-        let (expired, keep): (Vec<_>, Vec<_>) =
-            self.deferred.drain(..).partition(|d| d.deadline <= cutoff);
-        self.deferred = keep;
-        for d in expired {
-            self.score(
-                &d.subject,
-                &d.ancestors,
-                d.signal,
-                d.target.as_deref(),
-                d.ts_ns,
-            );
+    /// One of `key`'s deferred signals has left the queue.
+    fn release(&mut self, key: &ProcKey) {
+        if let Some(n) = self.held.get_mut(key) {
+            *n -= 1;
+            if *n == 0 {
+                self.held.remove(key);
+            }
         }
-        self.reap_exited();
     }
 
     /// Drops a process from the scorer, scan detector and every queue.
@@ -376,7 +611,7 @@ impl Pipeline {
             w.retain(|(k, _)| k != key);
         }
         self.pending.retain(|_, w| !w.is_empty());
-        if self.deferred.iter().any(|d| d.subject.key == *key) {
+        if self.held.contains_key(key) {
             if !self.exited.contains(key) {
                 self.exited.push(*key);
             }
@@ -388,7 +623,11 @@ impl Pipeline {
     fn drop_state(&mut self, key: &ProcKey) {
         self.scorer.on_exit(key);
         self.scan.on_exit(key);
-        self.groups.remove(key);
+        if let Some(g) = self.groups.remove(key) {
+            if let Some(s) = self.spoken.get_mut(&g) {
+                s.seen.remove(key);
+            }
+        }
     }
 
     /// Finishes forgetting exited processes once nothing of theirs is
@@ -398,7 +637,7 @@ impl Pipeline {
             .exited
             .iter()
             .copied()
-            .filter(|k| !self.deferred.iter().any(|d| d.subject.key == *k))
+            .filter(|k| !self.held.contains_key(k))
             .collect();
         self.exited.retain(|k| !done.contains(k));
         for k in done {
@@ -468,11 +707,20 @@ impl Pipeline {
         let Some(verdict) = verdict(d.tier) else {
             return;
         };
+        if !self.worth_saying(&g, subject.key, &d, ts_ns) {
+            self.incident_suppressed += 1;
+            return;
+        }
         let tree: Vec<ProcInfo> = std::iter::once(subject.clone())
             .chain(ancestors.iter().cloned())
             .filter(|p| !matches!(p.key.tgid, 1 | 2))
             .collect();
-        self.record(&d, tree, &g);
+        // Dropped (writer queue full): nothing counts as said, so the
+        // next decision tries again, telemetry included.
+        if !self.record(&d, tree, &g) {
+            return;
+        }
+        self.said(&g, subject.key, &d, ts_ns);
         let incident = g;
         self.sinks.emit(&TelemetryRecord {
             ts_unix_ns: now_ns(),
@@ -487,8 +735,41 @@ impl Pipeline {
                 .exe
                 .as_ref()
                 .map(|e| e.as_os_str().as_encoded_bytes().to_vec()),
+            target: target.map(|t| t.as_os_str().as_encoded_bytes().to_vec()),
             reasons: d.evidence.iter().map(|e| e.reason.clone()).collect(),
         });
+    }
+
+    /// Whether incident `g` should record this decision: its first, a
+    /// tier rise, this process showing this signal kind for the first
+    /// time, or a heartbeat since the incident last recorded.
+    fn worth_saying(&self, g: &str, key: ProcKey, d: &Decision, ts_ns: u64) -> bool {
+        let Some(s) = self.spoken.get(g) else {
+            return true;
+        };
+        let Some(last) = s.last_ns else {
+            return true;
+        };
+        let rose = s.tier.is_none_or(|t| d.tier > t);
+        let seen = s.seen.get(&key).copied().unwrap_or(0);
+        let new = d
+            .evidence
+            .last()
+            .is_some_and(|e| seen & bit(SignalKind::of(&e.signal)) == 0);
+        let beat = ts_ns.saturating_sub(last) >= HEARTBEAT_NS;
+        rose || new || beat
+    }
+
+    /// Notes what a recorded decision said: its tier, the time, and every
+    /// signal kind it carries for this process.
+    fn said(&mut self, g: &str, key: ProcKey, d: &Decision, ts_ns: u64) {
+        let s = self.spoken.entry(g.to_string()).or_default();
+        s.tier = s.tier.max(Some(d.tier));
+        s.last_ns = Some(s.last_ns.unwrap_or(0).max(ts_ns));
+        let seen = s.seen.entry(key).or_default();
+        for e in &d.evidence {
+            *seen |= bit(SignalKind::of(&e.signal));
+        }
     }
 
     /// Sum over kinds of the max decayed component across the live
@@ -528,11 +809,15 @@ impl Pipeline {
         }
     }
 
-    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) {
+    /// Sends the decision to be recorded; false if it was dropped.
+    fn record(&mut self, d: &Decision, tree: Vec<ProcInfo>, id: &str) -> bool {
         match &self.incidents.tx {
             Some(tx) => match tx.try_send((d.clone(), tree, self.mode, id.to_string())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => self.incident_dropped += 1,
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    self.incident_dropped += 1;
+                    false
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     self.incident_dropped += 1;
                     if !self.writer_gone_logged {
@@ -542,21 +827,70 @@ impl Pipeline {
                                  incidents are no longer recorded"
                         );
                     }
+                    false
                 }
             },
-            None => {
-                if let Err(e) = self
-                    .incidents
-                    .store
-                    .record_as(d, &tree, self.mode, Some(id))
-                {
+            None => match self
+                .incidents
+                .store
+                .record_as(d, &tree, self.mode, Some(id))
+            {
+                Ok(_) => true,
+                Err(e) => {
                     self.incidents.errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "aegisd: recording incident for tgid {} failed: {e:#}",
                         d.key.tgid
                     );
+                    false
                 }
-            }
+            },
+        }
+    }
+}
+
+/// Runs environment reads on their own threads, at most `max` at once. A
+/// read can block for good (a FUSE-backed environment), so a stuck
+/// thread is simply left behind; past the cap a job fails at once, and
+/// the pipeline's deadline covers any answer that never comes. Either
+/// way the process counts as tainted.
+pub struct EnvReaders {
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    max: usize,
+    reader: EnvReader,
+}
+
+impl EnvReaders {
+    pub fn new() -> Self {
+        Self::with(crate::proctable::read_environ, 16)
+    }
+
+    pub fn with(reader: EnvReader, max: usize) -> Self {
+        Self {
+            inflight: Arc::default(),
+            max,
+            reader,
+        }
+    }
+
+    /// Reads `job` off the caller's thread; `done` gets the answer.
+    pub fn spawn(&self, job: EnvJob, done: impl FnOnce(EnvJob, Option<Vec<u8>>) + Send + 'static) {
+        if self.inflight.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            done(job, None);
+            return;
+        }
+        let (n, read) = (self.inflight.clone(), self.reader);
+        let r = std::thread::Builder::new()
+            .name("aegis-env".into())
+            .spawn(move || {
+                let env = read(job.0.tgid, job.0.start_time_ns, job.1);
+                n.fetch_sub(1, Ordering::SeqCst);
+                done(job, env);
+            });
+        if r.is_err() {
+            // No answer will come; the deadline taints it.
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -664,7 +998,26 @@ mod tests {
             IncidentStore::open_at(&d, Some("boot".into()), now_ns() / 1_000_000_000).unwrap();
         let mut cfg = Config::default();
         cfg.allowlist.memfd_callers = vec!["/usr/bin/runc".into()];
-        let p = Pipeline::new(&cfg, Incidents::inline(store), sinks, Box::new(Pid1), false);
+        // Only allowlisted paths are verified. These tests watch
+        // verification of a few more, so list them where they forgive
+        // nothing here: a scanner needs root at a terminal, and no test
+        // process has a terminal.
+        cfg.allowlist.scan_binaries = [
+            "/usr/bin/bash",
+            "/usr/bin/x",
+            "/usr/bin/y",
+            "/usr/bin/python3",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .chain((0..MAX_PENDING + 3).map(|i| format!("/usr/bin/x{i}").into()))
+        .chain(std::env::current_exe().ok())
+        .collect();
+        let mut p = Pipeline::new(&cfg, Incidents::inline(store), sinks, Box::new(Pid1), false);
+        // No real processes behind these tgids: give each a clean
+        // environment.
+        p.env_auto = Some(|_| Some(b"PATH=/usr/bin\0".to_vec()));
+        p.table.host_pidns = |_| true;
         (p, Dir(d))
     }
 
@@ -739,9 +1092,9 @@ mod tests {
             p.verified(&exe_key("/usr/bin/runc"), v);
         } else {
             // Verdict never comes: the deadline fires them as Unverified.
-            p.flush_expired(Instant::now() + Duration::from_secs(3));
+            p.flush_expired(Instant::now() + DEFER_DEADLINE + Duration::from_secs(1));
         }
-        assert!(p.deferred.is_empty());
+        assert_eq!(p.deferred.len(), 0);
     }
 
     #[test]
@@ -779,7 +1132,7 @@ mod tests {
         p.handle(&ev(EventKind::Exit, 60));
         assert!(p.table.get(&key(60)).is_none());
         assert_eq!(p.deferred.len(), 2);
-        p.flush_expired(Instant::now() + Duration::from_secs(3));
+        p.flush_expired(Instant::now() + DEFER_DEADLINE + Duration::from_secs(1));
         let l = p.store().list();
         assert_eq!(l.len(), 1);
         assert_eq!(
@@ -800,7 +1153,7 @@ mod tests {
         p.handle(&ev(EventKind::MemfdCreate, 60));
         p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
         p.flush_all();
-        assert!(p.deferred.is_empty());
+        assert_eq!(p.deferred.len(), 0);
         assert_eq!(p.store().open_count(), 1);
     }
 
@@ -815,6 +1168,282 @@ mod tests {
         assert_eq!(p.deferred.len(), 1);
         p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
         assert_eq!(p.store().open_count(), 0);
+    }
+
+    #[test]
+    fn a_preloaded_runc_is_quarantined_even_once_verified() {
+        let (mut p, _d) = pipeline("preload");
+        p.env_auto = Some(|_| Some(b"LD_PRELOAD=/tmp/evil.so\0".to_vec()));
+        runc_self_clone(&mut p, Some(rpm("runc")));
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].verdict, "would_quarantine");
+        let inc = p
+            .store()
+            .get(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap();
+        assert!(
+            inc.evidence
+                .iter()
+                .any(|e| e.reason.ends_with("allowlist withheld: LD_PRELOAD is set")),
+            "{:?}",
+            inc.evidence
+        );
+        // Shown as verified all the same.
+        assert_eq!(inc.root.verification, "rpm_owned:runc");
+    }
+
+    #[test]
+    fn signals_wait_for_the_environment_read_off_the_loop() {
+        // Nothing answers by itself: the read is the caller's job.
+        let (mut p, _d) = pipeline("env-async");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let jobs = std::mem::take(&mut p.to_read_env);
+        assert_eq!(jobs.len(), 1);
+        assert!(p.table.get(&key(60)).unwrap().env_pending);
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        assert_eq!(p.deferred.len(), 1, "waits for the environment");
+        p.env_read(jobs[0], Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.deferred.len(), 0);
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        assert_eq!(p.store().open_count(), 0);
+    }
+
+    #[test]
+    fn an_environment_read_that_never_answers_taints_after_its_deadline() {
+        let (mut p, _d) = pipeline("env-stuck");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        assert_eq!(p.deferred.len(), 2);
+        // Not yet: the loop doesn't wait, it just hasn't heard.
+        p.flush_expired(Instant::now());
+        assert_eq!(p.deferred.len(), 2);
+        p.flush_expired(Instant::now() + ENV_DEADLINE + Duration::from_millis(1));
+        assert_eq!(p.deferred.len(), 0);
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].verdict, "would_quarantine");
+        // A late answer changes nothing.
+        p.env_read((key(60), (0, 0), 0), Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.store().list()[0].verdict, "would_quarantine");
+    }
+
+    #[test]
+    fn a_superseded_answer_for_the_same_image_is_ignored() {
+        let (mut p, _d) = pipeline("env-seq");
+        p.env_auto = None;
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let old = std::mem::take(&mut p.to_read_env)[0];
+        // runc re-execs the very same file: same key, same image.
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        let new = std::mem::take(&mut p.to_read_env)[0];
+        assert_eq!((old.0, old.1), (new.0, new.1));
+        assert_ne!(old.2, new.2);
+        // The old read lands late, and clean. It must not count.
+        p.env_read(old, Some(b"PATH=/usr/bin\0".to_vec()));
+        let me = p.table.get(&key(60)).unwrap();
+        assert!(me.env_pending);
+        assert!(me.taint().is_some());
+        // The current one does.
+        p.env_read(new, Some(b"PATH=/usr/bin\0".to_vec()));
+        assert_eq!(p.table.get(&key(60)).unwrap().taint(), None);
+    }
+
+    #[test]
+    fn a_reader_that_blocks_forever_never_blocks_the_caller() {
+        fn stuck(_: u32, _: u64, _: (u64, u64)) -> Option<Vec<u8>> {
+            loop {
+                std::thread::park();
+            }
+        }
+        let r = EnvReaders::with(stuck, 2);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Instant::now();
+        for i in 0..4 {
+            let tx = tx.clone();
+            r.spawn((key(i), (0, 0), 0), move |j, env| {
+                let _ = tx.send((j.0.tgid, env));
+            });
+        }
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // Two threads are stuck; the two past the cap fail at once.
+        let mut got: Vec<_> = rx.try_iter().collect();
+        got.sort();
+        assert_eq!(got, [(2, None), (3, None)]);
+    }
+
+    #[test]
+    fn a_ptraced_runc_is_quarantined_even_once_verified() {
+        let (mut p, _d) = pipeline("traced");
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        let mut a = ev(EventKind::Ptrace, 99);
+        a.ptrace_request = 0x4206;
+        a.target_tgid = 60;
+        p.handle(&a);
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP));
+        let l = p.store().list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].verdict, "would_quarantine");
+    }
+
+    #[test]
+    fn only_allowlisted_executables_are_verified() {
+        let (mut p, _d) = pipeline("not-listed");
+        p.handle(&exec(60, "/usr/bin/zzz", 0));
+        assert!(p.to_verify.is_empty());
+        assert!(p.pending.is_empty());
+        // Nothing to wait for, so nothing is deferred either.
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        assert_eq!(p.deferred.len(), 0);
+        p.handle(&exec(61, "/usr/bin/runc", 0));
+        assert_eq!(lookups(&p.to_verify), paths(&["/usr/bin/runc"]));
+    }
+
+    #[test]
+    fn the_deadline_outlasts_a_slow_verification() {
+        let (mut p, _d) = pipeline("slow");
+        p.handle(&exec(60, "/usr/bin/runc", 0));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        // Two rpm calls at their timeout: still waiting.
+        p.flush_expired(Instant::now() + 2 * RPM_TIMEOUT);
+        assert_eq!(p.deferred.len(), 1);
+        p.verified(&exe_key("/usr/bin/runc"), rpm("runc"));
+        assert_eq!(p.deferred.len(), 0);
+        assert_eq!(p.store().open_count(), 0);
+    }
+
+    #[test]
+    fn deferred_queue_has_a_global_cap() {
+        let (mut p, _d) = pipeline("global-cap");
+        let procs = MAX_DEFERRED / MAX_DEFERRED_PER_PROC + 2;
+        for t in 0..procs as u32 {
+            p.handle(&exec(10_000 + t, "/usr/bin/x", 0));
+            for _ in 0..MAX_DEFERRED_PER_PROC {
+                p.handle(&ev(EventKind::MemfdCreate, 10_000 + t));
+            }
+        }
+        assert_eq!(p.deferred.len(), MAX_DEFERRED);
+        assert_eq!(
+            p.deferred_overflow as usize,
+            procs * MAX_DEFERRED_PER_PROC - MAX_DEFERRED
+        );
+        assert_eq!(p.held.values().sum::<usize>(), MAX_DEFERRED);
+        p.verified(&exe_key("/usr/bin/x"), rpm("x"));
+        assert_eq!(p.deferred.len(), 0);
+        assert!(p.held.is_empty() && p.deferred.is_empty());
+    }
+
+    fn timeline_len(p: &Pipeline) -> usize {
+        let l = p.store().list();
+        assert_eq!(l.len(), 1, "{l:?}");
+        p.store()
+            .timeline(&crate::incident::IncidentId(l[0].id.clone()))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn an_open_incident_records_only_what_is_new() {
+        let (mut p, d) = pipeline_with("quiet", Sinks::jsonl_at);
+        let at = |mut e: Event, secs: u64| {
+            e.ts_ns = secs * 1_000_000_000;
+            e
+        };
+        let mx = || exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP);
+        // Unverified memfd exec: 85, an incident at quarantine at once.
+        p.handle(&exec(60, "/tmp/x", 0));
+        p.handle(&at(ev(EventKind::MemfdCreate, 60), 1));
+        p.handle(&at(mx(), 1));
+        assert_eq!(timeline_len(&p), 1);
+        // A thousand more of the same add nothing, though the tier stays
+        // up: each memfd exec tops its kind back up to 65.
+        for i in 0..1000 {
+            p.handle(&at(mx(), 2 + i / 100));
+        }
+        assert_eq!(timeline_len(&p), 1);
+        assert_eq!(p.incident_suppressed, 1000);
+        // A process in the tree showing a kind for the first time is news.
+        p.handle(&fork(60, 61));
+        p.handle(&at(ev(EventKind::MemfdCreate, 61), 20));
+        assert_eq!(timeline_len(&p), 2);
+        // A minute after that, one heartbeat, then quiet again.
+        p.handle(&at(mx(), 81));
+        p.handle(&at(mx(), 82));
+        assert_eq!(timeline_len(&p), 3);
+        assert_eq!(p.incident_suppressed, 1001);
+        // Telemetry follows the records one for one.
+        let log = d.0.with_extension("jsonl");
+        let n = std::fs::read_to_string(&log).unwrap().lines().count();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn a_decision_dropped_on_a_full_queue_is_not_taken_as_said() {
+        let (mut p, _d) = pipeline("full");
+        // A writer queue with room for one.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RecordJob>(1);
+        p.incidents.tx = Some(tx);
+        let mx = || exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP);
+        p.handle(&exec(60, "/tmp/x", 0));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        // The opening record takes the one slot; nothing drains it.
+        p.handle(&mx());
+        // A new process with a new kind: news, but the queue is full.
+        p.handle(&fork(60, 61));
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(p.incident_dropped, 1);
+        assert_eq!(p.incident_suppressed, 0);
+        // Room again: the same news is still news, and gets through.
+        assert_eq!(rx.try_iter().count(), 1, "the opening record");
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(rx.try_iter().count(), 1);
+        assert_eq!(p.incident_suppressed, 0);
+        // Said now, so a repeat is not.
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        assert_eq!(p.incident_suppressed, 1);
+    }
+
+    #[test]
+    fn an_exited_member_leaves_nothing_in_the_incident_state() {
+        let (mut p, _d) = pipeline("prune");
+        let mx = || exec(60, "/memfd:x (deleted)", EXEC_MEMFD | EXEC_FROM_TMP);
+        p.handle(&exec(60, "/tmp/x", 0));
+        p.handle(&ev(EventKind::MemfdCreate, 60));
+        p.handle(&mx());
+        p.handle(&fork(60, 61));
+        p.handle(&ev(EventKind::MemfdCreate, 61));
+        let g = p.groups[&key(61)].clone();
+        assert!(p.spoken[&g].seen.contains_key(&key(61)));
+        p.handle(&ev(EventKind::Exit, 61));
+        assert!(!p.spoken[&g].seen.contains_key(&key(61)));
+        assert!(p.spoken[&g].seen.contains_key(&key(60)));
+    }
+
+    #[test]
+    fn a_rising_tier_is_always_recorded() {
+        let (mut p, _d) = pipeline("rise");
+        // Shell at 65 (throttle), then a ptrace in the same process: 110.
+        split_chain(&mut p, 80, 81, 80);
+        let tl = p
+            .store()
+            .timeline(&crate::incident::IncidentId(p.store().list()[0].id.clone()))
+            .unwrap();
+        let tiers: Vec<&str> = tl.iter().map(|l| l["tier"].as_str().unwrap()).collect();
+        // The shell's scan opens it; the child's first tmp exec is news;
+        // its ptrace lifts the incident to quarantine.
+        assert_eq!(tiers, ["throttle", "throttle", "quarantine"], "{tl:?}");
+        // Each line carries only the evidence that is new with it.
+        assert!(tl
+            .iter()
+            .all(|l| l["evidence"].as_array().unwrap().len() == 1));
     }
 
     #[test]
@@ -863,7 +1492,7 @@ mod tests {
         p.verified(&exe_key("/tmp/st"), Verification::Unverified);
         p.handle(&ptrace_pid1(child));
         p.to_verify.clear();
-        assert!(p.deferred.is_empty());
+        assert_eq!(p.deferred.len(), 0);
     }
 
     #[test]
