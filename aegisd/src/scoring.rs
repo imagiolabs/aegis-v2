@@ -203,6 +203,11 @@ impl Scorer {
         self.allow = cfg.allowlist.clone();
     }
 
+    // ponytail: scores are decayed before this `>=`, so signals whose
+    // weights sum exactly to a threshold never reach it (any gap between
+    // them decays the sum just under). Keep canonical bursts clear of the
+    // line, as memfd_exec 65 does, or add an epsilon here if that stops
+    // being enough.
     pub fn tier(&self, score: f64) -> Tier {
         if score >= self.quarantine {
             Tier::Quarantine
@@ -564,12 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn memfd_create_then_memfd_exec_is_80_quarantine() {
+    fn memfd_create_then_memfd_exec_is_85_quarantine() {
         let mut s = Scorer::new(&cfg());
         let (p, b) = (evil(), bash());
         s.observe(&p, &[&b], Signal::MemfdCreate, None, S);
         let d = s.observe(&p, &[&b], Signal::MemfdExec, None, S);
-        assert_eq!((d.score, d.tier), (80.0, Tier::Quarantine));
+        assert_eq!((d.score, d.tier), (85.0, Tier::Quarantine));
     }
 
     #[test]
@@ -827,7 +832,7 @@ mod tests {
         // An unverified runc gets nothing.
         let fake = proc(61, "/usr/bin/runc", "runc", Verification::Modified);
         let d = Scorer::new(&c).observe(&fake, &[&bash()], Signal::MemfdExec, None, S);
-        assert_eq!(d.score, 60.0);
+        assert_eq!(d.score, 65.0);
     }
 
     #[test]
