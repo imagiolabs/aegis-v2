@@ -9,12 +9,23 @@ use crate::{build, in_container, Arch};
 
 pub fn rpm(engine: &str, arch: Arch) -> Result<()> {
     build(engine, arch, true)?;
+    // The licence texts of every crate in the binaries, for %license.
+    // --frozen keeps cargo-about to the crate sources already fetched,
+    // so the file depends on Cargo.lock alone and not on what a crate's
+    // git repo says today.
     // rpmbuild's own tree stays in the container; only the RPMs come out.
+    // The spec takes its Version from Cargo.toml, so the two can't drift.
+    let version = env!("CARGO_PKG_VERSION");
     let script = format!(
-        "rpmbuild -bb --target {arch} \
+        "cargo fetch --locked \
+         && cargo about generate --frozen --fail --workspace \
+            -c packaging/about.toml -o dist/{arch}/THIRD-PARTY-LICENSES \
+            packaging/about.hbs \
+         && rpmbuild -bb --target {arch} \
          --define '_topdir /tmp/rpmbuild' \
          --define '_sourcedir /src' \
          --define 'aegis_bindir /src/dist/{arch}' \
+         --define 'aegis_version {version}' \
          --define '_rpmdir /src/dist/rpm' \
          --define '_build_name_fmt %%{{NAME}}-%%{{VERSION}}-%%{{RELEASE}}.%%{{ARCH}}.rpm' \
          packaging/aegis-v2.spec"
