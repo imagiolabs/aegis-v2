@@ -16,7 +16,31 @@ excluded_parent_processes = [
     "/usr/bin/pip3",
 ]
 
-# Confined SELinux domains to trust. Empty on purpose; for example:
+# Binaries that don't score for calling memfd_create or for executing a
+# memfd. runc and crun copy themselves into a memfd and run that on every
+# container start. Like the parents above, this list and the two below
+# apply only to binaries that verify.
+memfd_callers = [
+    "/usr/bin/podman",
+    "/usr/bin/pipewire",
+    "/usr/bin/gnome-shell",
+    "/usr/bin/runc",
+    "/usr/bin/crun",
+]
+
+# Debuggers that may attach to a system daemon without scoring.
+ptrace_tracers = [
+    "/usr/bin/gdb",
+    "/usr/bin/strace",
+    "/usr/bin/perf",
+]
+
+# Scanners that don't score for an egress scan, but only when run by root
+# from a terminal: someone is at the keyboard.
+scan_binaries = ["/usr/bin/nmap"]
+
+# Confined SELinux domains to trust: their processes skip the temp-directory
+# exec and memfd_create scores. Empty on purpose; for example:
 #   excluded_selinux_domains = ["rpm_t"]
 # Never add unconfined_t: every root shell runs in it.
 excluded_selinux_domains = []
