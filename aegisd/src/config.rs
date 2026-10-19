@@ -430,6 +430,7 @@ fn unconfined_warning(path: &Path, a: &Allowlist) -> Option<Warning> {
 }
 
 impl Config {
+    #[cfg(test)]
     pub fn load(main: &Path, dropin_dir: &Path) -> Result<Config, ConfigError> {
         Self::load_checked(main, dropin_dir).map(|(c, _)| c)
     }
@@ -912,7 +913,9 @@ mod tests {
                 "/usr/bin/pipewire",
                 "/usr/bin/gnome-shell",
                 "/usr/bin/runc",
-                "/usr/bin/crun"
+                "/usr/bin/crun",
+                "/usr/lib/systemd/systemd",
+                "/usr/libexec/cockpit-tls"
             ]
         );
         assert_eq!(

@@ -21,6 +21,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use aegis_proto::IncidentSummary;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -128,16 +129,6 @@ pub struct Incident {
     pub evidence_truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct IncidentSummary {
-    pub id: IncidentId,
-    pub created: String,
-    pub updated: String,
-    pub verdict: String,
-    pub max_score: f64,
-    pub root_tgid: u32,
-}
-
 pub fn verdict(t: Tier) -> Option<&'static str> {
     match t {
         Tier::Log => None,
@@ -204,14 +195,26 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// Create a fresh incident dir under `root`, retrying on an id clash.
-fn create_incident_dir(root: &Path, taken: &BTreeMap<String, Incident>) -> Result<String> {
+/// A fresh id: `AEG-<UTC date>-<time>-<16 random bits>`.
+pub fn new_incident_id() -> String {
     let (y, mo, d, h, mi, s) = civil(now_ns() / 1_000_000_000);
+    let r = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish() as u16;
+    format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}")
+}
+
+/// Create a fresh incident dir under `root`: `want` first when given,
+/// then random ids, retrying on a clash.
+fn create_incident_dir(
+    root: &Path,
+    taken: &dyn Fn(&str) -> bool,
+    want: Option<&str>,
+) -> Result<String> {
+    let mut want = want.filter(|w| valid_id(w)).map(String::from);
     for _ in 0..32 {
-        let r = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish() as u16;
-        let id = format!("AEG-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{r:04x}");
-        if taken.contains_key(&id) {
+        let id = want.take().unwrap_or_else(new_incident_id);
+        if taken(&id) {
             continue;
         }
         match DirBuilder::new().mode(0o700).create(root.join(&id)) {
@@ -308,7 +311,22 @@ impl IncidentStore {
     /// Order on failure: `incident.json` is written first, then the
     /// timeline line, and memory is updated last. A failed call leaves
     /// disk at worst one step ahead; the next record rewrites it.
+    #[cfg(test)]
     pub fn record(&self, d: &Decision, tree: &[ProcInfo], mode: Mode) -> Result<IncidentId> {
+        self.record_as(d, tree, mode, None)
+    }
+
+    /// `record`, with the id a new incident should get. The event loop
+    /// picks it so telemetry can name the incident before the write is
+    /// done. Ignored when the process already belongs to an incident; on
+    /// the rare clash with an old directory a random id is used instead.
+    pub fn record_as(
+        &self,
+        d: &Decision,
+        tree: &[ProcInfo],
+        mode: Mode,
+        want: Option<&str>,
+    ) -> Result<IncidentId> {
         let Some(verdict) = verdict(d.tier) else {
             bail!("tier log is not an incident");
         };
@@ -316,27 +334,40 @@ impl IncidentStore {
             .iter()
             .find(|p| p.key == d.key)
             .context("decision process missing from tree")?;
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // The process's own membership wins; then the nearest ancestor's.
-        let existing = g.index.get(&d.key).cloned().or_else(|| {
-            tree.iter()
-                .filter(|p| p.key != d.key)
-                .find_map(|p| g.index.get(&p.key))
-                .cloned()
-        });
+        // The lock is held only to read and, at the end, to commit, never
+        // across the disk I/O in between: readers on the event loop (Status,
+        // IncidentsList) must not wait on an fsync. That is safe because
+        // one writer thread is the only caller of this method, so nothing
+        // else changes an incident between the read and the commit.
+        let (existing, boot_id) = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // The process's own membership wins; then the nearest ancestor's.
+            let existing = g.index.get(&d.key).cloned().or_else(|| {
+                tree.iter()
+                    .filter(|p| p.key != d.key)
+                    .find_map(|p| g.index.get(&p.key))
+                    .cloned()
+            });
+            let existing = existing.map(|id| g.incidents[&id].clone());
+            (existing, g.boot_id.clone().unwrap_or_default())
+        };
         let now = now_ns();
         let ts = rfc3339(now);
 
         let mut inc = match existing {
-            Some(id) => g.incidents[&id].clone(),
+            Some(inc) => inc,
             None => {
                 let root = ProcSummary::new(me);
+                let taken = |id: &str| {
+                    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.incidents.contains_key(id)
+                };
                 Incident {
-                    id: create_incident_dir(&self.dir, &g.incidents)?,
+                    id: create_incident_dir(&self.dir, &taken, want)?,
                     created: ts.clone(),
                     updated: ts.clone(),
                     updated_ns: now,
-                    boot_id: g.boot_id.clone().unwrap_or_default(),
+                    boot_id,
                     mode: mode_str(mode).into(),
                     verdict: verdict.into(),
                     max_score: d.score,
@@ -392,6 +423,7 @@ impl IncidentStore {
         writeln!(private_append(&dir.join("timeline.jsonl"))?, "{line}")?;
 
         let id = inc.id.clone();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.index.insert(d.key, id.clone());
         g.incidents.insert(id.clone(), inc);
         Ok(IncidentId(id))
@@ -402,7 +434,7 @@ impl IncidentStore {
         g.incidents
             .values()
             .map(|i| IncidentSummary {
-                id: IncidentId(i.id.clone()),
+                id: i.id.clone(),
                 created: i.created.clone(),
                 updated: i.updated.clone(),
                 verdict: i.verdict.clone(),
@@ -412,11 +444,42 @@ impl IncidentStore {
             .collect()
     }
 
+    /// Process memberships loaded at open, for the event loop to seed
+    /// its own grouping from once at startup.
+    pub fn memberships(&self) -> Vec<(ProcKey, String)> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.index.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// Every incident in memory is open: there is no close yet.
+    pub fn open_count(&self) -> usize {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.incidents.len()
+    }
+
+    /// The incident's timeline, one value per line; None if it has none.
+    /// A line that doesn't parse is skipped.
+    pub fn timeline(&self, id: &IncidentId) -> Option<Vec<serde_json::Value>> {
+        if !valid_id(&id.0) {
+            return None;
+        }
+        let raw = fs::read(self.dir.join(&id.0).join("timeline.jsonl")).ok()?;
+        Some(
+            raw.split(|&b| b == b'\n')
+                .filter_map(|l| serde_json::from_slice(l).ok())
+                .collect(),
+        )
+    }
+
     /// Memory first, then disk (incidents older than the load window).
     pub fn get(&self, id: &IncidentId) -> Option<Incident> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = g.incidents.get(&id.0) {
-            return Some(i.clone());
+        // Memory under the lock; the disk read after it is released.
+        let hit = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.incidents.get(&id.0).cloned()
+        };
+        if hit.is_some() {
+            return hit;
         }
         if !valid_id(&id.0) {
             return None;
