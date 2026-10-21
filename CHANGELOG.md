@@ -6,6 +6,32 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-21
+
+Two fixes the new lab demo caught in the evidence v0.1.0 writes.
+
+### Fixed
+
+- A process that joined an incident at an exec was listed under the
+  binary it was before the exec. The lab's copy of strace showed up as
+  `/usr/bin/timeout`. Members are now recorded as the image they run;
+  the evidence already named the right file.
+- Evidence recorded each signal as a Rust debug string, such as
+  `PtraceSystemDaemon { target: ProcKey { tgid: 1641528, start_time_ns: … } }`.
+  The `signal` field now holds the signal's weight key (`tmp_exec`,
+  `memfd_create`, `memfd_exec`, `ptrace_system_daemon`, `egress_scan`),
+  and the attached pid or the scan's target count moves into the
+  reason. Anything that parses `incident.json` or `timeline.jsonl`
+  should expect the new names; incidents already on disk keep the old
+  ones.
+
+### Security
+
+- OTLP export over https now uses rustls-webpki 0.103.16 and
+  webpki-roots 1.0.10, for RUSTSEC-2026-0382 (certificate verification
+  could accept distrusted intermediates) and RUSTSEC-2026-0381 (bundled
+  roots trusted distrusted emSign intermediates).
+
 ## [0.1.0] - 2026-10-19
 
 The first release, and it watches without touching. Install it, run it in
@@ -65,5 +91,6 @@ the host is stopped, moved or rewritten yet; that starts in v0.2.0.
 
 The [threat model](docs/threat-model.md) has the full list.
 
-[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jamesconwaydev/aegis-v2/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jamesconwaydev/aegis-v2/releases/tag/v0.1.0

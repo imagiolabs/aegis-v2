@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "aegis-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "aegis-ebpf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegis-common",
  "aya-ebpf",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "libc",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "aegisctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegis-proto",
  "clap",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "aegisd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aegis-common",
  "aegis-ebpf",
@@ -971,9 +971,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -1396,9 +1396,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
