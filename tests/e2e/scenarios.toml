@@ -144,6 +144,10 @@ expect = "none"
 # The ptrace steps here attach to a throwaway system service, not sshd:
 # a quarantine freezes the tracer, and sshd's listener would stop at its
 # next syscall waiting on it, taking every new login with it.
+#
+# A check refuses every pid or id it reads before using it: `case $P in
+# ''|*[!0-9]*) exit 1` fails on an empty answer and on more than one,
+# so a missing process can never make a check pass by default.
 
 [[scenario]]
 name = "quarantine-memfd-enforce"
@@ -155,7 +159,9 @@ timeout 5 sh -c 'until [ -s /run/aegis-sim.pid ]; do sleep 0.1; done'
 """
 expect = "quarantined"
 check = """
-CG=$(sed -n 's/^0:://p' /proc/$(cat /run/aegis-sim.pid)/cgroup)
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+CG=$(sed -n 's/^0:://p' /proc/$P/cgroup)
 case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
 grep -qx 'frozen 1' /sys/fs/cgroup$CG/cgroup.events
 [ "$(nft list table inet aegis | grep -c ' drop$')" = 1 ]
@@ -179,10 +185,15 @@ expect = "quarantined"
 check = """
 cg() { sed -n 's/^0:://p' /proc/$1/cgroup; }
 T=$(pgrep -f '^/tmp/aegis-strace[.]')
+case $T in ''|*[!0-9]*) exit 1 ;; esac
+PP=$(ps -o ppid= -p $T | tr -d ' ')
+case $PP in ''|*[!0-9]*) exit 1 ;; esac
+P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
 CG=$(cg $T)
 case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
-[ "$(cg $(ps -o ppid= -p $T))" = "$CG" ]
-[ "$(cg $(cat /run/aegis-sim.pid))" = "$CG" ]
+[ "$(cg $PP)" = "$CG" ]
+[ "$(cg $P)" = "$CG" ]
 grep -qx 'frozen 1' /sys/fs/cgroup$CG/cgroup.events
 """
 
@@ -201,6 +212,7 @@ setsid -f timeout 30 $S -e trace=none -p $P </dev/null >/dev/null 2>&1
 expect = "throttled"
 check = """
 T=$(pgrep -f '^/tmp/aegis-strace[.]')
+case $T in ''|*[!0-9]*) exit 1 ;; esac
 CG=$(sed -n 's/^0:://p' /proc/$T/cgroup)
 case $CG in */aegis-throttle.slice/aegis-incident-*.scope) ;; *) exit 1 ;; esac
 [ "$(cat /sys/fs/cgroup$CG/cpu.max)" = "25000 100000" ]
@@ -222,8 +234,10 @@ done
 expect = "quarantined"
 check = """
 P=$(cat /run/aegis-sim.pid)
+case $P in ''|*[!0-9]*) exit 1 ;; esac
 kill -0 $P
 CG=$(sed -n 's/^0:://p' /proc/$P/cgroup)
+case $CG in */aegis-quarantine.slice/aegis-incident-*-q.scope) ;; *) exit 1 ;; esac
 grep -qx 'frozen 0' /sys/fs/cgroup$CG/cgroup.events
 [ "$(nft list table inet aegis 2>/dev/null | grep -c ' drop$')" = 0 ]
 """
@@ -243,7 +257,11 @@ done
 expect = "quarantined"
 check = """
 P=$(cat /run/aegis-sim.pid)
-U=aegis-incident-$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')-q.scope
+case $P in ''|*[!0-9]*) exit 1 ;; esac
+I=$(aegisctl incidents list | awk '$2 == "quarantined" {print $1}')
+case $I in AEG-*) ;; *) exit 1 ;; esac
+case $I in *[!A-Za-z0-9-]*) exit 1 ;; esac
+U=aegis-incident-$I-q.scope
 timeout 5 sh -c "while kill -0 $P || systemctl is-active -q $U; do sleep 0.1; done" 2>/dev/null
 """
 

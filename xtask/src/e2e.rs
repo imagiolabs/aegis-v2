@@ -454,6 +454,8 @@ fn run_scenario(remote: &Remote, s: &Scenario) -> Result<Row> {
     if s.mode != "enforce" {
         return judge(remote, s);
     }
+    // A run killed part-way may have left a target or scope behind.
+    let _ = remote.try_run(SWEEP);
     // Whatever happens in the scenario, the host is put back after it.
     let row = set_mode(remote, "enforce").and_then(|()| judge(remote, s));
     let ended = end_enforce(remote).map_err(|e| eprintln!("  {}: ending: {e:#}", s.name));
