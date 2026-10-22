@@ -192,10 +192,18 @@ fn summarize(json: &str) -> Result<String> {
 /// (`date '+%x %T'` on the host). Fails closed: an ssh failure, a
 /// missing ausearch or any ausearch failure other than "no matches" is
 /// an error, never a clean result.
+///
+/// Without a terminal ausearch reads stdin, not the audit log, and
+/// answers `<no matches>` to everything; `--input-logs` stops that. As
+/// a guard against any other way it could read nothing, it must first
+/// find some event since the marker: every ssh login in between writes
+/// several, so an empty answer there means the log isn't being read.
 fn avc_since(remote: &Remote, marker: &str) -> Result<bool> {
     let (ok, out, err) = remote.try_run(&format!(
         "command -v ausearch >/dev/null || {{ echo 'ausearch not found' >&2; exit 2; }}; \
-         ausearch -m AVC,USER_AVC,SELINUX_ERR -ts {marker}"
+         ausearch --input-logs -ts {marker} </dev/null >/dev/null 2>&1 \
+           || {{ echo 'ausearch saw no events at all since the marker' >&2; exit 2; }}; \
+         ausearch --input-logs -m AVC,USER_AVC,SELINUX_ERR -ts {marker} </dev/null"
     ))?;
     judge_ausearch(ok, &out, &err)
 }
@@ -508,6 +516,12 @@ mod tests {
         // Any other failure fails the check rather than reading clean.
         assert!(judge_ausearch(false, "", "Invalid start time\n").is_err());
         assert!(judge_ausearch(false, "", "ausearch not found\n").is_err());
+        assert!(judge_ausearch(
+            false,
+            "",
+            "ausearch saw no events at all since the marker\n"
+        )
+        .is_err());
         assert!(judge_ausearch(false, "", "").is_err());
     }
 }
