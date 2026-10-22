@@ -27,10 +27,10 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{Config, ConfigHandle};
-use crate::enforce::enforcer::{spawn_enforcer, EnforcerHandle};
+use crate::enforce::enforcer::{spawn_enforcer, EnforceJob, EnforcerHandle};
 use crate::enforce::nft::Nft;
 use crate::enforce::systemd::{Limits, Systemd};
 use crate::incident::{IncidentId, IncidentStore};
@@ -314,6 +314,9 @@ async fn run(cli: &Cli, cfg: ConfigHandle) -> Result<()> {
                         let _ = reply.send(answer_disk(req, &store));
                     });
                 }
+                Request::IncidentRelease { .. } | Request::IncidentKill { .. } => {
+                    enforce_admin(req, &enforcer, reply);
+                }
                 _ => {
                     let _ = reply.send(answer(req, &pipe, &handle, &enforcer, &cfg, started));
                 }
@@ -417,6 +420,60 @@ fn answer(
     }
 }
 
+/// How long a release or kill may wait for the enforcer, which runs one
+/// job at a time and may be mid-way through a quarantine.
+const ENFORCER_WAIT: Duration = Duration::from_secs(30);
+
+/// Hands a release or kill to the enforcer and answers when it does.
+/// The wait is in its own task so the event loop never blocks on it. It
+/// acts on recorded actions, so it works in audit mode too.
+fn enforce_admin(req: Request, enforcer: &EnforcerHandle, reply: oneshot::Sender<Response>) {
+    enforce_admin_in(req, &enforcer.tx, ENFORCER_WAIT, reply);
+}
+
+fn enforce_admin_in(
+    req: Request,
+    queue: &std::sync::mpsc::SyncSender<EnforceJob>,
+    wait: Duration,
+    reply: oneshot::Sender<Response>,
+) {
+    let (id, kill) = match req {
+        Request::IncidentRelease { id } => (id, false),
+        Request::IncidentKill { id } => (id, true),
+        _ => return,
+    };
+    if !aegis_proto::is_incident_id(&id) {
+        let _ = reply.send(Response::Error("not an incident id".into()));
+        return;
+    }
+    let (tx, rx) = oneshot::channel();
+    let reply_to = Some(tx);
+    let job = if kill {
+        EnforceJob::Kill {
+            id,
+            reply: reply_to,
+        }
+    } else {
+        EnforceJob::Release {
+            id,
+            reply: reply_to,
+        }
+    };
+    if queue.try_send(job).is_err() {
+        let _ = reply.send(Response::Error("enforcer busy, try again".into()));
+        return;
+    }
+    tokio::spawn(async move {
+        let r = match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(Ok(done))) => Response::Done(done),
+            Ok(Ok(Err(e))) => Response::Error(e),
+            Ok(Err(_)) => Response::Error("the enforcer stopped before answering".into()),
+            Err(_) => Response::Error("timed out waiting for the enforcer".into()),
+        };
+        let _ = reply.send(r);
+    });
+}
+
 /// The incident requests that read from disk.
 fn answer_disk(req: Request, store: &IncidentStore) -> Response {
     let missing = || Response::Error("no such incident".into());
@@ -514,4 +571,59 @@ fn event_json(ev: &Event) -> Value {
         v.extend(extra);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    const ID: &str = "AEG-20261021-000000-0123456789abcdef";
+
+    async fn ask(
+        id: &str,
+        queue: &std::sync::mpsc::SyncSender<EnforceJob>,
+        wait: Duration,
+    ) -> Response {
+        let (tx, rx) = oneshot::channel();
+        enforce_admin_in(Request::IncidentKill { id: id.into() }, queue, wait, tx);
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_requests_refuse_bad_ids_and_a_full_queue() {
+        let (q, _rx) = sync_channel(0);
+        let r = ask("../etc", &q, Duration::from_secs(1)).await;
+        assert_eq!(r, Response::Error("not an incident id".into()));
+        // Nothing is receiving on a zero-capacity queue: full.
+        let r = ask(ID, &q, Duration::from_secs(1)).await;
+        assert_eq!(r, Response::Error("enforcer busy, try again".into()));
+    }
+
+    #[tokio::test]
+    async fn admin_requests_time_out_and_relay_answers() {
+        let (q, rx) = sync_channel(2);
+        let r = ask(ID, &q, Duration::from_millis(20)).await;
+        assert_eq!(
+            r,
+            Response::Error("timed out waiting for the enforcer".into())
+        );
+        // The first job is still queued; answer the second one.
+        let _stale = rx.recv().unwrap();
+        let (tx, answer) = oneshot::channel();
+        enforce_admin_in(
+            Request::IncidentKill { id: ID.into() },
+            &q,
+            Duration::from_secs(5),
+            tx,
+        );
+        let EnforceJob::Kill { reply: Some(r), .. } = rx.recv().unwrap() else {
+            panic!("not a kill")
+        };
+        r.send(Ok(format!("killed {ID}"))).unwrap();
+        assert_eq!(
+            answer.await.unwrap(),
+            Response::Done(format!("killed {ID}"))
+        );
+    }
 }
