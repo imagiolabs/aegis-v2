@@ -16,6 +16,12 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 pub type Run = fn(&str, &[String]) -> Result<String>;
 /// Is this tgid still the process that started at this time?
 pub type Alive = fn(u32, u64) -> bool;
+/// Reads a cgroup's `cgroup.events` file, given its path. Tests pass a fake.
+pub type Events = fn(&str) -> Result<String>;
+
+fn read_events(path: &str) -> Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
 
 /// Runs `prog args`, returning stdout; errors on spawn failure, timeout
 /// or a non-zero exit (with stderr).
@@ -41,6 +47,7 @@ pub struct Limits {
 pub struct Systemd {
     run: Run,
     alive: Alive,
+    events: Events,
 }
 
 impl Systemd {
@@ -49,7 +56,38 @@ impl Systemd {
     }
 
     pub fn with(run: Run, alive: Alive) -> Self {
-        Self { run, alive }
+        Self {
+            run,
+            alive,
+            events: read_events,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Does the kernel say the scope is frozen? `systemctl freeze` can
+    /// exit non-zero after the freeze took effect, so the exit status
+    /// alone cannot tell.
+    pub fn is_frozen(&self, slice: &str, scope: &str) -> Result<bool> {
+        let path = format!(
+            "/sys/fs/cgroup/{}/cgroup.events",
+            super::nft::Nft::scope_cgroup(slice, scope)
+        );
+        match (self.events)(&path) {
+            Ok(t) => Ok(t.lines().any(|l| l.trim() == "frozen 1")),
+            // No cgroup: every process is gone, so nothing is frozen.
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Moves `pids` into a new transient scope under `slice`.
@@ -332,6 +370,34 @@ mod tests {
             w
         };
         assert_eq!(c, [want(&["2", "10", "11"]), want(&["1", "10"])]);
+    }
+
+    #[test]
+    fn is_frozen_reads_the_scopes_cgroup_events() {
+        fn events(p: &str) -> Result<String> {
+            assert_eq!(
+                p,
+                "/sys/fs/cgroup/aegis.slice/s.slice/u.scope/cgroup.events"
+            );
+            Ok("populated 1\nfrozen 1\n".into())
+        }
+        fn thawed(_: &str) -> Result<String> {
+            Ok("populated 1\nfrozen 0\n".into())
+        }
+        let s = Systemd::with(ok, alive_10).with_events(events);
+        assert!(s.is_frozen("s.slice", "u.scope").unwrap());
+        let s = Systemd::with(ok, alive_10).with_events(thawed);
+        assert!(!s.is_frozen("s.slice", "u.scope").unwrap());
+        fn gone(_: &str) -> Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+        }
+        fn denied(_: &str) -> Result<String> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        }
+        let s = Systemd::with(ok, alive_10).with_events(gone);
+        assert!(!s.is_frozen("s.slice", "u.scope").unwrap());
+        let s = Systemd::with(ok, alive_10).with_events(denied);
+        assert!(s.is_frozen("s.slice", "u.scope").is_err());
     }
 
     #[test]
